@@ -63,15 +63,15 @@ def gconv(N, G, F, C, W, H, KH, KW, **compare_kwargs):
     compare('tc_gconv(tc_I, tc_W1)', 'nn_gconv(nn_I)', **compare_kwargs)
 
 torch.backends.cudnn.benchmark = True
-autotune_kwargs = dict(generations=args.generations, pop_size=args.pop_size, number_elites=args.number_elites)
+autotune_kwargs = dict(gpus='0,1', generations=args.generations, pop_size=args.pop_size, number_elites=args.number_elites)
 
-tmm(128, 32, 256, repeat=100, number=10000)
+tmm(128, 32, 256, repeat=10, number=10000)
 tmm(128, 1024, 1024, repeat=10, number=1000)
 tmm(128, 4096, 16384, repeat=10, number=10)
-
-tbmm(500, 72, 26, 26, repeat=100, number=10000)
 
 gconv(32, 32, 16, 16, 14, 14, 3, 3, repeat=10, number=1000)
 gconv(32, 32, 32, 32, 7, 7, 3, 3, repeat=10, number=1000)
 gconv(32, 32, 4, 4, 56, 56, 3, 3, repeat=10, number=1000)
 gconv(32, 32, 8, 8, 28, 28, 3, 3, repeat=10, number=1000)
+
+tbmm(500, 72, 26, 26, repeat=10, number=100000)
