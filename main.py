@@ -9,81 +9,69 @@ from torch.autograd import Variable
 import tensor_comprehensions as tc
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--generations', type=int, default=2)
-parser.add_argument('--pop-size', type=int, default=10)
-parser.add_argument('--number-elites', type=int, default=1)
+parser.add_argument('--generations', type=int, default=25)
+parser.add_argument('--pop-size', type=int, default=100)
+parser.add_argument('--number-elites', type=int, default=10)
 args = parser.parse_args()
 
 def compare(stmt1, stmt2, repeat, number):
     o1 = eval(stmt1)
     o2 = eval(stmt2)
-    print((o1 - o2).abs().max().data[0], 'output diff')
+    print((o1.view(-1) - o2.view(-1)).abs().max().data[0], 'diff')
     import builtins
     builtins.__dict__.update(globals())
     print(min(timeit.repeat(stmt1, repeat=repeat, number=number)), stmt1)
     print(min(timeit.repeat(stmt2, repeat=repeat, number=number)), stmt2)
     print()
 
-tests = ['tbmm']
-autotune_kwargs = dict(
-    generations=args.generations, 
-    pop_size=args.pop_size, 
-    number_elites=args.number_elites)
+def tmm(M, K, N, **compare_kwargs):
+    global A, B, tc_tmm
+    print('tmm(M={}, K={}, N={})'.format(M, K, N))
+    A = Variable(torch.Tensor(M, K).cuda().normal_())
+    B = Variable(torch.Tensor(N, K).cuda().normal_())
+    tc_tmm = tc.define('''
+    def tmm(float(M, K) A, float(N, K) B) -> (C) {
+        C(m, n) +=! A(m, kk) * B(n, kk)
+    }''', name='tmm')
+    tc_tmm.autotune(A, B, options=tc.Options('mlp'), **autotune_kwargs)
+    compare('tc_tmm(A, B)', 'torch.mm(A, B.t())', **compare_kwargs)
 
-# matrix-vector multiplication
-if 'mv' in tests:
-    m, k = 256, 128
-    A = Variable(torch.Tensor(m, k).cuda().normal_())
-    x = Variable(torch.Tensor(k).cuda().normal_())
-    mv = tc.define('''
-    def mv(float(n, m) A, float(m) x) -> (y) {
-        y(i) +=! A(i, j) * x(j)
-    }
-    ''', name='mv')
-    mv.autotune(A, x, options=tc.Options('mlp'), **autotune_kwargs)
-    compare('mv(A, x)', 'torch.mv(A, x)', repeat=10, number=10000)
+def tbmm(B, M, K, N, **compare_kwargs):
+    global X, Y, tc_tbmm
+    print('tbmm(B={}, M={}, K={}, N={})'.format(B, M, K, N))
+    X = Variable(torch.Tensor(B, N, M).cuda().normal_())
+    Y = Variable(torch.Tensor(B, K, M).cuda().normal_())
+    tc_tbmm = tc.define('''
+    def tbmm(float(B, N, M) X, float(B, K, M) Y) -> (Z) {
+        Z(b, n, k) +=! X(b, n, m) * Y(b, k, m)
+    }''', name='tbmm')
+    tc_tbmm.autotune(X, Y, options=tc.Options('mlp'), **autotune_kwargs)
+    compare('tc_tbmm(X, Y)', 'torch.bmm(X, Y.transpose(1, 2))', **compare_kwargs)
 
-# matrix-matrix multiplication
-if 'mm' in tests:
-    n, m, k = 128, 256, 128
-    A = Variable(torch.Tensor(n, m).cuda().normal_())
-    B = Variable(torch.Tensor(m, k).cuda().normal_())
-    mm = tc.define('''
-    def mm(float(N, M) A, float(M, K) B) -> (C) {
-        C(i, j) +=! A(i, k) * B(k, j)
-    }
-    ''', name='mm')
-    mm.autotune(A, B, options=tc.Options('mlp'), **autotune_kwargs)
-    compare('mm(A, B)', 'torch.mm(A, B)', repeat=10, number=10000)
+def gconv(N, G, F, C, W, H, KH, KW, **compare_kwargs):
+    global tc_I, tc_W1, tc_gconv, nn_I, nn_gconv
+    print('gconv(N={}, G={}, F={}, C={}, W={}, H={}, KH={}, KW={})'.format(N, G, F, C, W, H, KH, KW))
+    tc_I = Variable(torch.Tensor(N, G, C, H, W).cuda().normal_())
+    nn_I = tc_I.view(N, G * C, H, W)
+    nn_gconv = nn.Conv2d(G * C, G * F, (KH, KW), groups=G, bias=False).cuda()
+    tc_W1 = nn_gconv.weight.view(G, F, C, KH, KW)
+    tc_gconv = tc.define('''
+    def gconv(float(N, G, C, H, W) I, float(G, F, C, KW, KW) W1) -> (O) {
+        O(n, g, o, h, w) +=! I(n, g, i, h + kh, w + kw) * W1(g, o, i, kh, kw)
+    }''', name='gconv')
+    tc_gconv.autotune(tc_I, tc_W1, options=tc.Options('group_conv'), **autotune_kwargs)
+    compare('tc_gconv(tc_I, tc_W1)', 'nn_gconv(nn_I)', **compare_kwargs)
 
-# Liner + ReLU
-if 'fcrelu' in tests:
-    n_in, n_out, bs = 128, 256, 32
-    X = Variable(torch.Tensor(bs, n_in).cuda().normal_())
-    module = nn.Sequential(nn.Linear(n_in, n_out), nn.ReLU(True)).cuda()
-    W = module[0].weight
-    b = module[0].bias
-    fcrelu = tc.define('''
-    def fcrelu(float(bs, n_in) X, float(n_out, n_in) W, float(n_out) bias) -> (Y) {
-        Y(i, j) +=! W(j, k) * X(i, k)
-        Y(i, j) += bias(j)
-        Y(i, j) = fmax(Y(i, j), 0)
-    }''', name='fcrelu')
-    fcrelu.autotune(X, W, b, options=tc.Options('mlp'), **autotune_kwargs)
-    compare('fcrelu(X, W, b)', 'module(X)', repeat=10, number=10000)
+torch.backends.cudnn.benchmark = True
+autotune_kwargs = dict(generations=args.generations, pop_size=args.pop_size, number_elites=args.number_elites)
 
-if 'conv' in tests:
-    torch.backends.cudnn.benchmark = True
-    input_fm, output_fm, ks, w, h, bs = 3, 64, 3, 224, 224, 32
-    input = Variable(torch.Tensor(bs, input_fm, h, w).cuda().normal_())
-    nn_conv2d = nn.Conv2d(input_fm, output_fm, ks).cuda()
-    weight = nn_conv2d.weight
-    bias = nn_conv2d.bias
-    tc_conv2d = tc.define('''
-    def conv(float(bs, input_fm, h, w) input, float(output_fm, input_fm, ks, ks) weight, float(output_fm) bias) -> (out) {
-        out(b, o_fm, i, j) +=! input(b, i_fm, i + ii, j + jj) * weight(o_fm, i_fm, ii, jj)
-        out(b, o_fm, i, j) += bias(o_fm)
-    }''', name='conv')
-    tc_conv2d.autotune(input, weight, bias, options=tc.Options('conv'), **autotune_kwargs)
-    compare('tc_conv2d(input, weight, bias)', 'nn_conv2d(input)', repeat=10, number=100)
+tmm(128, 32, 256, repeat=100, number=10000)
+tmm(128, 1024, 1024, repeat=10, number=1000)
+tmm(128, 4096, 16384, repeat=10, number=10)
 
+tbmm(500, 72, 26, 26, repeat=100, number=10000)
+
+gconv(32, 32, 16, 16, 14, 14, 3, 3, repeat=10, number=1000)
+gconv(32, 32, 32, 32, 7, 7, 3, 3, repeat=10, number=1000)
+gconv(32, 32, 4, 4, 56, 56, 3, 3, repeat=10, number=1000)
+gconv(32, 32, 8, 8, 28, 28, 3, 3, repeat=10, number=1000)
